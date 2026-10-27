@@ -1,0 +1,28 @@
+multitenancy_enabled: false
+target: all
+server:
+  http_listen_port: 9009
+  log_level: warn
+common:
+  storage:
+    backend: filesystem
+    filesystem:
+      dir: /tmp/mimir/data
+blocks_storage:
+  storage_prefix: blocks
+  tsdb:
+    dir: /tmp/mimir/tsdb
+ingester:
+  ring:
+    kvstore: { store: inmemory }
+    replication_factor: 1
+distributor:
+  ring:
+    kvstore: { store: inmemory }
+store_gateway:
+  sharding_ring:
+    kvstore: { store: inmemory }
+    replication_factor: 1
+compactor:
+  sharding_ring:
+    kvstore: { store: inmemory }

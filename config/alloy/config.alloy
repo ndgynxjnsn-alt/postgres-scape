@@ -1,0 +1,128 @@
+// ---------------- Metrics ----------------
+prometheus.exporter.postgres "pg" {
+  data_source_names  = ["postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable"]
+  enabled_collectors = ["stat_statements"]
+}
+
+// Ubuntu host statistics (node_exporter): CPU, memory, disks, filesystems, network, ...
+prometheus.exporter.unix "host" {
+  procfs_path = "/host/proc"
+  sysfs_path  = "/host/sys"
+  rootfs_path = "/host"
+  enable_collectors = ["systemd"]
+}
+
+prometheus.scrape "pg" {
+  targets         = array.concat(prometheus.exporter.postgres.pg.targets, prometheus.exporter.unix.host.targets)
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.mimir.receiver]
+}
+
+prometheus.remote_write "mimir" {
+  endpoint {
+    url = "http://localhost:9009/api/v1/push"
+  }
+}
+
+// ---------------- Logs ----------------
+// Persist read offsets so a restart neither re-sends nor skips lines
+otelcol.storage.file "offsets" {
+  directory = "/var/lib/alloy/data/filelog"
+}
+
+otelcol.receiver.filelog "pg" {
+  include  = ["/var/log/postgresql/*.json"]
+  start_at = "beginning"
+  storage  = otelcol.storage.file.offsets.handler
+  output {
+    logs = [otelcol.processor.transform.pg.input]
+  }
+}
+
+otelcol.processor.transform "pg" {
+  error_mode = "ignore"
+
+  log_statements {
+    context = "resource"
+    statements = [
+      `set(attributes["service.name"], "postgresql")`,
+      `set(attributes["db.system.name"], "postgresql")`,
+    ]
+  }
+
+  // 1) Raw JSON line -> attributes (original line kept as log.record.original)
+  log_statements {
+    context    = "log"
+    conditions = [`body != nil and Substring(body, 0, 2) == "{\""`]
+    statements = [
+      `set(attributes["log.record.original"], body)`,
+      `merge_maps(attributes, ParseJSON(body), "upsert")`,
+    ]
+  }
+
+  // 2) Timestamp + severity normalization (OTel Logs Data Model)
+  log_statements {
+    context = "log"
+    statements = [
+      `set(time, Time(attributes["timestamp"], "%Y-%m-%d %H:%M:%S.%f %Z")) where attributes["timestamp"] != nil`,
+      `set(observed_time, time) where attributes["timestamp"] != nil`,
+
+      `set(severity_text, ToUpperCase(attributes["error_severity"])) where attributes["error_severity"] != nil`,
+      `set(severity_number, SEVERITY_NUMBER_DEBUG)  where IsMatch(severity_text, "^DEBUG")`,
+      `set(severity_number, SEVERITY_NUMBER_INFO)   where severity_text == "INFO"`,
+      `set(severity_number, SEVERITY_NUMBER_INFO2)  where severity_text == "NOTICE"`,
+      `set(severity_number, SEVERITY_NUMBER_INFO4)  where severity_text == "LOG"`,
+      `set(severity_number, SEVERITY_NUMBER_WARN)   where severity_text == "WARNING"`,
+      `set(severity_number, SEVERITY_NUMBER_ERROR)  where severity_text == "ERROR"`,
+      `set(severity_number, SEVERITY_NUMBER_FATAL)  where severity_text == "FATAL"`,
+      `set(severity_number, SEVERITY_NUMBER_FATAL4) where severity_text == "PANIC"`,
+    ]
+  }
+
+  // 3) Legacy jsonlog fields -> Semantic Conventions (+ postgresql.* for the rest)
+  log_statements {
+    context = "log"
+    statements = [
+      `set(body, attributes["message"]) where attributes["message"] != nil`,
+
+      `set(attributes["user.name"], attributes["user"]) where attributes["user"] != nil`,
+      `set(attributes["db.namespace"], attributes["dbname"]) where attributes["dbname"] != nil`,
+      `set(attributes["db.query.text"], attributes["statement"]) where attributes["statement"] != nil`,
+      `set(attributes["db.response.status_code"], attributes["state_code"]) where attributes["state_code"] != nil`,
+      `set(attributes["client.address"], attributes["remote_host"]) where attributes["remote_host"] != nil`,
+      `set(attributes["client.port"], Int(attributes["remote_port"])) where attributes["remote_port"] != nil`,
+      `set(attributes["process.pid"], Int(attributes["pid"])) where attributes["pid"] != nil`,
+      `set(attributes["process.parent_pid"], Int(attributes["leader_pid"])) where attributes["leader_pid"] != nil`,
+      `set(attributes["session.id"], attributes["session_id"]) where attributes["session_id"] != nil`,
+      `set(attributes["code.function.name"], attributes["func_name"]) where attributes["func_name"] != nil`,
+      `set(attributes["code.file.path"], attributes["file_name"]) where attributes["file_name"] != nil`,
+      `set(attributes["code.line.number"], Int(attributes["file_line_num"])) where attributes["file_line_num"] != nil`,
+
+      `set(attributes["postgresql.backend_type"], attributes["backend_type"]) where attributes["backend_type"] != nil`,
+      `set(attributes["postgresql.application_name"], attributes["application_name"]) where attributes["application_name"] != nil`,
+      // query_id is int64; ParseJSON yields float64 and loses precision -> take it from the raw line
+      `set(attributes["postgresql.query_id"], ExtractPatterns(attributes["log.record.original"], "\"query_id\":(?P<id>-?[0-9]+)")["id"]) where attributes["query_id"] != nil`,
+      `set(attributes["postgresql.txid"], attributes["txid"]) where attributes["txid"] != nil`,
+      `set(attributes["postgresql.vxid"], attributes["vxid"]) where attributes["vxid"] != nil`,
+      `set(attributes["postgresql.detail"], attributes["detail"]) where attributes["detail"] != nil`,
+      `set(attributes["postgresql.hint"], attributes["hint"]) where attributes["hint"] != nil`,
+      `set(attributes["postgresql.context"], attributes["context"]) where attributes["context"] != nil`,
+      `set(attributes["postgresql.internal_query"], attributes["internal_query"]) where attributes["internal_query"] != nil`,
+      `set(attributes["postgresql.line_num"], Int(attributes["line_num"])) where attributes["line_num"] != nil`,
+      `set(attributes["postgresql.cursor_position"], Int(attributes["cursor_position"])) where attributes["cursor_position"] != nil`,
+      `set(attributes["postgresql.internal_position"], Int(attributes["internal_position"])) where attributes["internal_position"] != nil`,
+
+      `delete_matching_keys(attributes, "^(timestamp|error_severity|message|user|dbname|statement|state_code|remote_host|remote_port|pid|leader_pid|session_id|func_name|file_name|file_line_num|backend_type|application_name|query_id|txid|vxid|detail|hint|context|internal_query|line_num|cursor_position|internal_position|ps|session_start)$")`,
+    ]
+  }
+
+  output {
+    logs = [otelcol.exporter.otlphttp.loki.input]
+  }
+}
+
+otelcol.exporter.otlphttp "loki" {
+  client {
+    endpoint = "http://localhost:3100/otlp"
+  }
+}

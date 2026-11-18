@@ -1,6 +1,13 @@
+// Sidecar on the PostgreSQL host, shipping to graf_zahl (LGTM + Pyroscope on this machine):
+//   metrics  -> Mimir (remote_write, :9009)
+//   logs     -> graf_zahl Alloy (OTLP, :4318) -> Loki
+//   traces   -> graf_zahl Alloy (OTLP, :4318) -> Tempo
+//   profiles -> graf_zahl Alloy (:9999)        -> Pyroscope
+
 // ---------------- Metrics ----------------
 prometheus.exporter.postgres "pg" {
-  data_source_names  = ["postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable"]
+  // options: don't let pg_tracing trace the exporter's own polling queries
+  data_source_names  = ["postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable&options=-c%20pg_tracing.sample_rate%3D0"]
   enabled_collectors = ["stat_statements"]
 }
 
@@ -117,12 +124,91 @@ otelcol.processor.transform "pg" {
   }
 
   output {
-    logs = [otelcol.exporter.otlphttp.loki.input]
+    logs = [otelcol.exporter.otlphttp.graf_zahl.input]
   }
 }
 
-otelcol.exporter.otlphttp "loki" {
+// ---------------- Traces (pg_tracing) ----------------
+// pg_tracing's background worker posts OTLP/HTTP JSON here (pg_tracing.otel_endpoint).
+// Not 4318: on the host network that port belongs to graf_zahl's Alloy.
+otelcol.receiver.otlp "pg_tracing" {
+  http {
+    endpoint = "127.0.0.1:14318"
+  }
+  output {
+    traces = [otelcol.processor.transform.pg_tracing.input]
+  }
+}
+
+otelcol.processor.transform "pg_tracing" {
+  error_mode = "ignore"
+
+  trace_statements {
+    context = "resource"
+    statements = [
+      `set(attributes["db.system.name"], "postgresql")`,
+    ]
+  }
+
+  output {
+    traces = [otelcol.exporter.otlphttp.graf_zahl.input]
+  }
+}
+
+// graf_zahl's Alloy is the stack's single OTLP entrypoint (fans out to Loki / Tempo)
+otelcol.exporter.otlphttp "graf_zahl" {
   client {
-    endpoint = "http://localhost:3100/otlp"
+    endpoint = "http://localhost:4318"
+  }
+}
+
+// ---------------- Profiles (eBPF) ----------------
+// CPU profiles of the PostgreSQL processes, taken by the kernel (no agent in Postgres).
+// Find our postgres container via Docker, then its processes via /proc (pid: host).
+discovery.docker "local" {
+  host = "unix:///host/run/docker.sock"   // not /host/var/run: /var/run -> /run is an absolute symlink
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=postgres-scrape", "com.docker.compose.service=postgres"]
+  }
+}
+
+// discovery.process joins external targets on __container_id__
+discovery.relabel "pg_container" {
+  targets = discovery.docker.local.targets
+  rule {
+    source_labels = ["__meta_docker_container_id"]
+    target_label  = "__container_id__"
+  }
+}
+
+discovery.process "pg" {
+  join = discovery.relabel.pg_container.output
+}
+
+discovery.relabel "pg" {
+  targets = discovery.process.pg.targets
+  // only processes of the joined container carry docker meta labels
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = ".+"
+    action        = "keep"
+  }
+  rule {
+    target_label = "service_name"
+    replacement  = "postgresql"
+  }
+}
+
+pyroscope.ebpf "pg" {
+  targets        = discovery.relabel.pg.output
+  forward_to     = [pyroscope.write.graf_zahl.receiver]
+  // Postgres is native code; the Python unwinder also fails the verifier on kernel 7.0
+  python_enabled = false
+}
+
+pyroscope.write "graf_zahl" {
+  endpoint {
+    url = "http://localhost:9999"
   }
 }

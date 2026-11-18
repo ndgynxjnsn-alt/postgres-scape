@@ -1,13 +1,19 @@
-# PostgreSQL 18 + Grafana Alloy sidecar -> Mimir (metrics) / Loki (logs) / Grafana
-#   docker compose up -d
-#   Grafana: http://localhost:3001 (anonymous admin)
+# PostgreSQL 18 (pg_stat_statements, pg_tracing, slow query log) + Grafana Alloy sidecar
+# shipping metrics, logs, traces and eBPF profiles to graf_zahl (../graf_zahl).
+#   (cd ../graf_zahl && docker compose up -d)   # backends + Grafana on :3000
+#   docker compose up -d --build
 #   Slow query test: docker compose exec postgres psql -U postgres -c 'SELECT pg_sleep(1.5)'
+#
+# Both containers use the host network, like a native install on the Ubuntu server:
+# Postgres listens on localhost:5432, Alloy reaches it and graf_zahl via localhost.
 
 name: postgres-scrape
 
 services:
   postgres:
-    image: postgres:18.6
+    build: ./postgres   # postgres:18.6 + pg_tracing
+    image: postgres-scrape-postgres:local
+    network_mode: host
     environment:
       POSTGRES_PASSWORD: postgres
     command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
@@ -15,26 +21,25 @@ services:
       - source: pg_conf
         target: /etc/postgresql/postgresql.conf
       - source: pg_init
-        target: /docker-entrypoint-initdb.d/01-pg_stat_statements.sql
+        target: /docker-entrypoint-initdb.d/01-extensions.sql
     volumes:
       - pgdata:/var/lib/postgresql
       - pglogs:/var/log/postgresql
-    ports:
-      - "5432:5432"
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
       interval: 5s
       retries: 10
 
   alloy:
     image: grafana/alloy:v1.21.2
-    # Host namespaces so node metrics (network, processes) describe the server, not the container.
-    # Consequently Alloy reaches postgres/mimir/loki via their published ports on localhost.
+    # Host namespaces so node metrics (network, processes) describe the server, not the container,
+    # and so pyroscope.ebpf sees the Postgres processes.
     network_mode: host
     pid: host
+    privileged: true   # pyroscope.ebpf loads BPF programs
     command:
       - run
-      - --server.http.listen-addr=127.0.0.1:12345
+      - --server.http.listen-addr=127.0.0.1:12346   # graf_zahl's Alloy owns :12345
       - --storage.path=/var/lib/alloy/data
       - --stability.level=public-preview   # otelcol.receiver.filelog
       - /etc/alloy/config.alloy
@@ -43,44 +48,42 @@ services:
         target: /etc/alloy/config.alloy
     volumes:
       - pglogs:/var/log/postgresql:ro
-      - /:/host:ro,rslave
+      - /:/host:ro,rslave              # node metrics; Docker socket for eBPF target discovery
       - /run/systemd:/run/systemd:ro   # systemd collector (private D-Bus socket)
       - /run/udev:/run/udev:ro         # diskstats device properties
       - alloydata:/var/lib/alloy/data
     depends_on:
       postgres: { condition: service_healthy }
-      mimir: { condition: service_started }
-      loki: { condition: service_started }
 
-  # ---- test backends -------------------------------------------------------
+  # ---- demo client: its traces continue into pg_tracing's spans ------------
 
-  mimir:
-    image: grafana/mimir:3.2.3
-    command: ["-config.file=/etc/mimir.yaml"]
-    configs:
-      - source: mimir
-        target: /etc/mimir.yaml
-    ports:
-      - "127.0.0.1:9009:9009"
-
-  loki:
-    image: grafana/loki:3.7.9
-    command: ["-config.file=/etc/loki/local-config.yaml"]
-    ports:
-      - "127.0.0.1:3100:3100"
-
-  grafana:
-    image: grafana/grafana:13.3.0
+  app:
+    build: ./app   # Spring Boot + OTel Java agent, http://localhost:8090/books
+    image: postgres-scrape-app:local
+    network_mode: host
     environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-      GF_AUTH_DISABLE_LOGIN_FORM: "true"
-    configs:
-      - source: grafana_datasources
-        target: /etc/grafana/provisioning/datasources/datasources.yaml
-    ports:
-      - "3001:3000"
-    depends_on: [mimir, loki]
+      OTEL_SERVICE_NAME: pg-client
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318   # graf_zahl's Alloy
+      OTEL_METRIC_EXPORT_INTERVAL: "15000"
+      # Appends /*traceparent='...'*/ to every statement; pg_tracing makes its spans children of the JDBC span
+      OTEL_INSTRUMENTATION_JDBC_EXPERIMENTAL_SQLCOMMENTER_ENABLED: "true"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  load:
+    image: curlimages/curl:8.17.0
+    network_mode: host
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        until curl -sf localhost:8090/books >/dev/null; do sleep 2; done
+        while :; do
+          curl -s localhost:8090/books >/dev/null
+          curl -s localhost:8090/books/$$((RANDOM % 6 + 1)) >/dev/null   # id 6 -> 500
+          [ $$((RANDOM % 5)) -eq 0 ] && curl -s localhost:8090/report >/dev/null
+          sleep 1
+        done
+    depends_on: [app]
 
 volumes:
   pgdata:
@@ -94,7 +97,3 @@ configs:
     file: ./config/postgres/init.sql
   alloy:
     file: ./config/alloy/config.alloy
-  mimir:
-    file: ./config/mimir/mimir.yaml
-  grafana_datasources:
-    file: ./config/grafana/datasources.yaml

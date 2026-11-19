@@ -1,0 +1,93 @@
+# Copy of ../../graf_zahl (the LGTM + Pyroscope backends), adapted for this project:
+#   - multi-tenant: Loki, Mimir, Tempo and Pyroscope require X-Scope-OrgID; Grafana reads tenant "fish"
+#   - one entrypoint, as in the lab (../../lgtm): https://alloy.org, Traefik routes by path to Alloy
+#     (OTLP /v1/*, Pyroscope pushes /ingest). Self-signed: trust certs/ca.crt; run certs/generate.sh first
+#   - config files are bind-mounted directories (edit + restart; no recreate needed)
+#   - only Traefik and Grafana are published, on 127.0.0.1 and on ports that don't clash with the original
+#     graf_zahl (the backends and Alloy stay on the internal network)
+#
+#   Grafana          http://localhost:3001  (anonymous admin)
+#   Alloy            https://alloy.org      OTLP/HTTP (/v1/*), Pyroscope pushes (/ingest), UI (/)
+#
+# Included by ../docker-compose.yaml; it also runs on its own: docker compose up -d
+
+services:
+  # TLS + path routing in front of Alloy (the lab's Traefik ingress for alloy.<domain>)
+  traefik:
+    image: traefik:v3.6.2
+    restart: unless-stopped
+    command:
+      - --entrypoints.websecure.address=:443
+      - --providers.file.directory=/etc/traefik/dynamic
+    volumes:
+      - ./traefik:/etc/traefik/dynamic:ro
+      - ./certs:/etc/traefik/certs:ro
+    ports:
+      - "127.0.0.1:443:443"
+    depends_on: [alloy]
+
+  alloy:
+    image: grafana/alloy:v1.21.2
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy:/etc/alloy:ro
+    depends_on: [loki, tempo, mimir, pyroscope]
+
+  loki:
+    image: grafana/loki:3.7.3
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./loki:/etc/loki:ro
+      - loki-data:/loki
+
+  tempo:
+    image: grafana/tempo:3.0.2
+    restart: unless-stopped
+    command: -config.file=/etc/tempo/tempo-config.yml
+    volumes:
+      - ./tempo:/etc/tempo:ro
+      - tempo-data:/var/tempo
+
+  mimir:
+    image: grafana/mimir:3.1.3
+    restart: unless-stopped
+    command: -config.file=/etc/mimir/mimir-config.yml
+    volumes:
+      - ./mimir:/etc/mimir:ro
+      - mimir-data:/data
+
+  pyroscope:
+    image: grafana/pyroscope:2.1.1
+    restart: unless-stopped
+    command:
+      - -config.file=/etc/pyroscope/config.yaml
+      - -auth.multitenancy-enabled=true
+    volumes:
+      - pyroscope-data:/data
+
+  grafana:
+    image: grafana/grafana:13.1.0
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE: traceToProfiles
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3001:3000"   # the original graf_zahl uses 3000
+    depends_on: [loki, tempo, mimir, pyroscope]
+
+volumes:
+  loki-data:
+  tempo-data:
+  mimir-data:
+  pyroscope-data:
+  grafana-data:

@@ -1,0 +1,23 @@
+# Custom SQL queries for prometheus.exporter.postgres "business" (custom-metrics.alloy).
+# Metric name: <query name>_<column>. Columns are GAUGE (value) or LABEL.
+
+# ##### BEGIN BUSINESS METRICS: table "catch" #####################################################
+# HAVING: no row (and no misleading 0 timestamp) while the table is empty
+fish_catch:
+  query: |
+    SELECT count(*)                         AS rows,
+           extract(epoch FROM min(caught_at)) AS oldest_timestamp_seconds,
+           extract(epoch FROM max(caught_at)) AS newest_timestamp_seconds
+    FROM catch
+    HAVING count(*) > 0
+  metrics:
+    - rows:
+        usage: GAUGE
+        description: Rows in table catch
+    - oldest_timestamp_seconds:
+        usage: GAUGE
+        description: caught_at of the oldest row, Unix seconds
+    - newest_timestamp_seconds:
+        usage: GAUGE
+        description: caught_at of the newest row, Unix seconds
+# ##### END BUSINESS METRICS #######################################################################

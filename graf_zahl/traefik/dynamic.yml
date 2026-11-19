@@ -1,0 +1,38 @@
+# https://alloy.org -> central Alloy, routed by path (same routes as the lab's ingress for alloy.<domain>):
+#   /v1/                                   OTLP/HTTP          -> alloy:4318
+#   /ingest, /push.v1.PusherService/       Pyroscope pushes   -> alloy:9999
+#   /                                      Alloy UI           -> alloy:12345
+# TLS ends here, with the certificate from ../certs (signed by the self-made root CA).
+http:
+  routers:
+    alloy-otlp:
+      rule: Host(`alloy.org`) && PathPrefix(`/v1/`)
+      service: alloy-otlp
+      tls: {}
+    alloy-profiles:
+      rule: Host(`alloy.org`) && (PathPrefix(`/ingest`) || PathPrefix(`/push.v1.PusherService/`))
+      service: alloy-profiles
+      tls: {}
+    alloy-ui:
+      rule: Host(`alloy.org`)
+      service: alloy-ui
+      tls: {}
+
+  services:
+    alloy-otlp:
+      loadBalancer:
+        servers:
+          - url: http://alloy:4318
+    alloy-profiles:
+      loadBalancer:
+        servers:
+          - url: http://alloy:9999
+    alloy-ui:
+      loadBalancer:
+        servers:
+          - url: http://alloy:12345
+
+tls:
+  certificates:
+    - certFile: /etc/traefik/certs/alloy.org.crt
+      keyFile: /etc/traefik/certs/alloy.org.key

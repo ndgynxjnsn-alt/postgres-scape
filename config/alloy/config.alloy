@@ -1,14 +1,25 @@
-// Sidecar on the PostgreSQL host, shipping to graf_zahl (LGTM + Pyroscope on this machine):
-//   metrics  -> Mimir (remote_write, :9009)
-//   logs     -> graf_zahl Alloy (OTLP, :4318) -> Loki
-//   traces   -> graf_zahl Alloy (OTLP, :4318) -> Tempo
-//   profiles -> graf_zahl Alloy (:9999)        -> Pyroscope
+// Sidecar on the PostgreSQL host. Ships everything to the central Alloy, https://alloy.org (see graf_zahl/):
+//   metrics   Postgres, host, custom (custom-metrics.alloy)   OTLP /v1/*, tenant: X-Scope-OrgID header
+//   logs      Postgres jsonlog, systemd journal              OTLP /v1/*, tenant: X-Scope-OrgID header
+//   traces    pg_tracing                                     OTLP /v1/*, tenant: X-Scope-OrgID header
+//   profiles  eBPF                                           Pyroscope push, tenant: label "tenant"
+// TENANT, SERVICE_NAME and PG_CONTAINER come from the environment (../../.env).
+// Alloy loads every *.alloy file in this directory; components can reference each other across files.
 
 // ---------------- Metrics ----------------
 prometheus.exporter.postgres "pg" {
   // options: don't let pg_tracing trace the exporter's own polling queries
   data_source_names  = ["postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable&options=-c%20pg_tracing.sample_rate%3D0"]
   enabled_collectors = ["stat_statements"]
+}
+
+// job becomes service.name in OTLP: the same name as the logs, traces and profiles
+discovery.relabel "pg" {
+  targets = prometheus.exporter.postgres.pg.targets
+  rule {
+    target_label = "job"
+    replacement  = sys.env("SERVICE_NAME")
+  }
 }
 
 // Ubuntu host statistics (node_exporter): CPU, memory, disks, filesystems, network, ...
@@ -19,19 +30,20 @@ prometheus.exporter.unix "host" {
   enable_collectors = ["systemd"]
 }
 
-prometheus.scrape "pg" {
-  targets         = array.concat(prometheus.exporter.postgres.pg.targets, prometheus.exporter.unix.host.targets)
+prometheus.scrape "default" {
+  targets         = array.concat(discovery.relabel.pg.output, prometheus.exporter.unix.host.targets)
   scrape_interval = "15s"
-  forward_to      = [prometheus.remote_write.mimir.receiver]
+  forward_to      = [otelcol.receiver.prometheus.default.receiver]
 }
 
-prometheus.remote_write "mimir" {
-  endpoint {
-    url = "http://localhost:9009/api/v1/push"
+// Prometheus samples -> OTLP, so all signals take the same way to the central Alloy
+otelcol.receiver.prometheus "default" {
+  output {
+    metrics = [otelcol.processor.batch.default.input]
   }
 }
 
-// ---------------- Logs ----------------
+// ---------------- Logs: PostgreSQL (jsonlog) ----------------
 // Persist read offsets so a restart neither re-sends nor skips lines
 otelcol.storage.file "offsets" {
   directory = "/var/lib/alloy/data/filelog"
@@ -52,7 +64,7 @@ otelcol.processor.transform "pg" {
   log_statements {
     context = "resource"
     statements = [
-      `set(attributes["service.name"], "postgresql")`,
+      string.format("set(attributes[\"service.name\"], %q)", sys.env("SERVICE_NAME")),
       `set(attributes["db.system.name"], "postgresql")`,
     ]
   }
@@ -124,13 +136,91 @@ otelcol.processor.transform "pg" {
   }
 
   output {
-    logs = [otelcol.exporter.otlphttp.graf_zahl.input]
+    logs = [otelcol.processor.batch.default.input]
+  }
+}
+
+// ---------------- Logs: systemd journal ----------------
+// Everything in journalctl (max. the last 7 h on first start), with the entry's own timestamp.
+loki.relabel "journal" {
+  forward_to = []
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["__journal_syslog_identifier"]
+    target_label  = "syslog_identifier"
+  }
+  rule {
+    source_labels = ["__journal_priority"]
+    target_label  = "priority"
+  }
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "priority_keyword"
+  }
+  rule {
+    source_labels = ["__journal__hostname"]
+    target_label  = "host"
+  }
+}
+
+loki.source.journal "host" {
+  path          = "/host/var/log/journal"
+  relabel_rules = loki.relabel.journal.rules
+  forward_to    = [otelcol.receiver.loki.journal.receiver]
+}
+
+// Loki entries -> OTLP logs: labels become log attributes, the journal timestamp the record's time
+otelcol.receiver.loki "journal" {
+  output {
+    logs = [otelcol.processor.transform.journal.input]
+  }
+}
+
+otelcol.processor.transform "journal" {
+  error_mode = "ignore"
+
+  log_statements {
+    context = "log"
+    statements = [
+      // service.name: the systemd unit, else the syslog identifier (kernel, sudo, ...)
+      `set(attributes["service.name"], attributes["unit"]) where attributes["unit"] != nil`,
+      `set(attributes["service.name"], attributes["syslog_identifier"]) where attributes["service.name"] == nil`,
+      `set(attributes["host.name"], attributes["host"])`,
+
+      // journald priority (syslog) -> OTel severity
+      `set(severity_text, ToUpperCase(attributes["priority_keyword"])) where attributes["priority_keyword"] != nil`,
+      `set(severity_number, SEVERITY_NUMBER_FATAL4) where attributes["priority"] == "0"`,
+      `set(severity_number, SEVERITY_NUMBER_FATAL3) where attributes["priority"] == "1"`,
+      `set(severity_number, SEVERITY_NUMBER_FATAL)  where attributes["priority"] == "2"`,
+      `set(severity_number, SEVERITY_NUMBER_ERROR)  where attributes["priority"] == "3"`,
+      `set(severity_number, SEVERITY_NUMBER_WARN)   where attributes["priority"] == "4"`,
+      `set(severity_number, SEVERITY_NUMBER_INFO2)  where attributes["priority"] == "5"`,
+      `set(severity_number, SEVERITY_NUMBER_INFO)   where attributes["priority"] == "6"`,
+      `set(severity_number, SEVERITY_NUMBER_DEBUG)  where attributes["priority"] == "7"`,
+
+      `delete_matching_keys(attributes, "^(unit|syslog_identifier|host|priority|priority_keyword|loki\\.attribute\\.labels)$")`,
+    ]
+  }
+
+  output {
+    logs = [otelcol.processor.groupbyattrs.journal.input]
+  }
+}
+
+// One resource per unit/host: moves service.name and host.name from the records to the resource
+otelcol.processor.groupbyattrs "journal" {
+  keys = ["service.name", "host.name"]
+  output {
+    logs = [otelcol.processor.batch.default.input]
   }
 }
 
 // ---------------- Traces (pg_tracing) ----------------
 // pg_tracing's background worker posts OTLP/HTTP JSON here (pg_tracing.otel_endpoint).
-// Not 4318: on the host network that port belongs to graf_zahl's Alloy.
+// Not 4318: on the host network that port belongs to the central Alloy.
 otelcol.receiver.otlp "pg_tracing" {
   http {
     endpoint = "127.0.0.1:14318"
@@ -151,25 +241,37 @@ otelcol.processor.transform "pg_tracing" {
   }
 
   output {
-    traces = [otelcol.exporter.otlphttp.graf_zahl.input]
+    traces = [otelcol.processor.batch.default.input]
   }
 }
 
-// graf_zahl's Alloy is the stack's single OTLP entrypoint (fans out to Loki / Tempo)
-otelcol.exporter.otlphttp "graf_zahl" {
+// ---------------- To the central Alloy ----------------
+otelcol.processor.batch "default" {
+  output {
+    metrics = [otelcol.exporter.otlphttp.central.input]
+    logs    = [otelcol.exporter.otlphttp.central.input]
+    traces  = [otelcol.exporter.otlphttp.central.input]
+  }
+}
+
+otelcol.exporter.otlphttp "central" {
   client {
-    endpoint = "http://localhost:4318"
+    endpoint = "https://alloy.org"
+    headers  = { "X-Scope-OrgID" = sys.env("TENANT") }
+    tls {
+      ca_file = "/etc/alloy-certs/ca.crt"   // self-signed root CA of the central Alloy
+    }
   }
 }
 
 // ---------------- Profiles (eBPF) ----------------
 // CPU profiles of the PostgreSQL processes, taken by the kernel (no agent in Postgres).
-// Find our postgres container via Docker, then its processes via /proc (pid: host).
+// Find the Postgres container by name via Docker, then its processes via /proc (pid: host).
 discovery.docker "local" {
   host = "unix:///host/run/docker.sock"   // not /host/var/run: /var/run -> /run is an absolute symlink
   filter {
-    name   = "label"
-    values = ["com.docker.compose.project=postgres-scrape", "com.docker.compose.service=postgres"]
+    name   = "name"
+    values = ["^/" + sys.env("PG_CONTAINER") + "$"]
   }
 }
 
@@ -186,7 +288,7 @@ discovery.process "pg" {
   join = discovery.relabel.pg_container.output
 }
 
-discovery.relabel "pg" {
+discovery.relabel "pg_processes" {
   targets = discovery.process.pg.targets
   // only processes of the joined container carry docker meta labels
   rule {
@@ -196,19 +298,24 @@ discovery.relabel "pg" {
   }
   rule {
     target_label = "service_name"
-    replacement  = "postgresql"
+    replacement  = sys.env("SERVICE_NAME")
   }
 }
 
 pyroscope.ebpf "pg" {
-  targets        = discovery.relabel.pg.output
-  forward_to     = [pyroscope.write.graf_zahl.receiver]
+  targets        = discovery.relabel.pg_processes.output
+  forward_to     = [pyroscope.write.central.receiver]
   // Postgres is native code; the Python unwinder also fails the verifier on kernel 7.0
   python_enabled = false
 }
 
-pyroscope.write "graf_zahl" {
+pyroscope.write "central" {
   endpoint {
-    url = "http://localhost:9999"
+    url = "https://alloy.org"
+    tls_config {
+      ca_file = "/etc/alloy-certs/ca.crt"
+    }
   }
+  // The central Alloy routes profiles by this label (pyroscope.receive_http drops request headers)
+  external_labels = { "tenant" = sys.env("TENANT") }
 }

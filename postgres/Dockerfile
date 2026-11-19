@@ -1,13 +1,14 @@
-# PostgreSQL 18 + pg_tracing (https://github.com/DataDog/pg_tracing)
-# PG18 support is only on main (no release yet), so pin a commit.
-ARG PG_IMAGE=postgres:18.6
+# TimescaleDB (PostgreSQL 18, Alpine) + pg_tracing (https://github.com/DataDog/pg_tracing)
+# BASE_IMAGE: any timescale/timescaledb-based PG18 image, e.g. the one your existing database runs on
+#   (lnf9s35w2/my-offline-timescale:pg18), so all extensions of the existing data are there.
+# The base runs PostgreSQL as user postgres, uid 70.
+ARG BASE_IMAGE=timescale/timescaledb:2.24.0-pg18
 
-FROM ${PG_IMAGE} AS build
+FROM ${BASE_IMAGE} AS build
+# PG18 support is only on pg_tracing's main branch (no release yet), so pin a commit.
 ARG PG_TRACING_COMMIT=c343277660011200212c4e0833eea0c6b1ee8fa2
-RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential ca-certificates curl \
-      libcurl4-openssl-dev postgresql-server-dev-${PG_MAJOR} \
- && rm -rf /var/lib/apt/lists/*
+# PGXS also compiles LLVM bitcode for JIT (the base PostgreSQL is built --with-llvm): clang19/llvm19
+RUN apk add --no-cache build-base clang19 llvm19-dev curl curl-dev
 WORKDIR /src
 RUN curl -fsSL https://github.com/DataDog/pg_tracing/archive/${PG_TRACING_COMMIT}.tar.gz \
       | tar xz --strip-components=1 \
@@ -16,9 +17,10 @@ RUN curl -fsSL https://github.com/DataDog/pg_tracing/archive/${PG_TRACING_COMMIT
  && make -j"$(nproc)" \
  && make install DESTDIR=/out
 
-FROM ${PG_IMAGE}
-# Runtime dependency for the OTLP exporter (background worker)
-RUN apt-get update \
- && apt-get install -y --no-install-recommends libcurl4t64 \
- && rm -rf /var/lib/apt/lists/*
+FROM ${BASE_IMAGE}
+# Runtime dependency of pg_tracing's OTLP exporter (background worker)
+RUN apk add --no-cache libcurl
 COPY --from=build /out/ /
+# Log directory for logging_collector, readable for the Alloy sidecar through the shared volume.
+# A new named volume mounted here takes over this owner (postgres, uid 70).
+RUN install -d -o postgres -g postgres -m 0755 /var/log/postgresql

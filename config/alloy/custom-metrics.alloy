@@ -1,0 +1,110 @@
+// Custom metrics: two minimal examples of metrics no exporter has built in.
+// Both feed the sidecar's metric pipeline (config.alloy) and end up in Mimir, tenant $TENANT.
+
+
+// ##### BEGIN BUSINESS METRICS: table "catch" ##################################################
+// Oldest and newest row of a table, plus its row count. The SQL lives in business-queries.yaml
+// (postgres_exporter only reads custom queries from a file).
+//   fish_catch_rows
+//   fish_catch_oldest_timestamp_seconds   age:  time() - fish_catch_oldest_timestamp_seconds
+//   fish_catch_newest_timestamp_seconds   age:  time() - fish_catch_newest_timestamp_seconds
+
+// A second exporter with only the custom queries (the built-in metrics come from "pg" in config.alloy)
+prometheus.exporter.postgres "business" {
+  data_source_names          = ["postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable&options=-c%20pg_tracing.sample_rate%3D0"]
+  disable_default_metrics    = true
+  disable_settings_metrics   = true
+  custom_queries_config_path = "/etc/alloy/business-queries.yaml"
+}
+
+discovery.relabel "business" {
+  targets = prometheus.exporter.postgres.business.targets
+  rule {
+    target_label = "job"
+    replacement  = sys.env("SERVICE_NAME")
+  }
+}
+
+prometheus.scrape "business" {
+  targets         = discovery.relabel.business.output
+  scrape_interval = "30s"
+  forward_to      = [otelcol.receiver.prometheus.default.receiver]
+}
+// ##### END BUSINESS METRICS ###################################################################
+
+
+// ##### BEGIN FILE METRICS: *.log files in /var/log/fish-demo ###################################
+// Count, oldest and youngest modification time of the files matching a glob.
+//   file_count{directory}
+//   file_mtime_oldest{directory}   age of the oldest file:    time() - file_mtime_oldest
+//   file_mtime_newest{directory}   age of the youngest file:  time() - file_mtime_newest
+//   file_mtime{file_path}, file_size_bytes{file_path}   (per file, built in)
+otelcol.receiver.file_stats "demo_logs" {
+  include             = "/var/log/fish-demo/*.log"
+  collection_interval = "30s"
+  metrics {
+    file.count {
+      enabled = true
+    }
+  }
+  resource_attributes {
+    file.path {
+      enabled = true
+    }
+  }
+  output {
+    metrics = [otelcol.processor.transform.demo_logs.input]
+  }
+}
+
+// file_stats reports each file as its own resource (file.path). Move the path onto the data points
+// and drop it from the resource, so all files share one resource and can be aggregated.
+otelcol.processor.transform "demo_logs" {
+  error_mode = "ignore"
+
+  metric_statements {
+    context = "datapoint"
+    statements = [
+      `set(datapoint.attributes["file.path"], resource.attributes["file.path"]) where resource.attributes["file.path"] != nil`,
+      `set(datapoint.attributes["directory"], "/var/log/fish-demo")`,
+    ]
+  }
+  metric_statements {
+    context = "resource"
+    statements = [
+      `delete_matching_keys(resource.attributes, "^file\\.")`,
+      `set(resource.attributes["service.name"], "fish-demo-logs")`,
+    ]
+  }
+
+  output {
+    metrics = [otelcol.processor.groupbyattrs.demo_logs.input]
+  }
+}
+
+// No keys: merges the now identical resources into one
+otelcol.processor.groupbyattrs "demo_logs" {
+  output {
+    metrics = [otelcol.processor.transform.demo_logs_age.input]
+  }
+}
+
+// Oldest / youngest file: min / max of the per-file modification times
+otelcol.processor.transform "demo_logs_age" {
+  error_mode = "ignore"
+
+  metric_statements {
+    context = "metric"
+    statements = [
+      `copy_metric(name="file.mtime.oldest") where metric.name == "file.mtime"`,
+      `copy_metric(name="file.mtime.newest") where metric.name == "file.mtime"`,
+      `aggregate_on_attributes("min", ["directory"]) where metric.name == "file.mtime.oldest"`,
+      `aggregate_on_attributes("max", ["directory"]) where metric.name == "file.mtime.newest"`,
+    ]
+  }
+
+  output {
+    metrics = [otelcol.processor.batch.default.input]
+  }
+}
+// ##### END FILE METRICS #######################################################################
